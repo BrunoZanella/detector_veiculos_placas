@@ -6,3 +6,5 @@ pillow==10.2.0
 torch==2.2.0
 torchvision==0.17.0
 ultralytics==8.1.2
+streamlit-webrtc
+av
