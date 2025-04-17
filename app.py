@@ -466,7 +466,7 @@ def main():
             rtc_configuration = RTCConfiguration(
                 {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
             )
-            
+
             # Usar WebRTC para acessar a câmera do usuário
             with video_placeholder.container():
                 webrtc_ctx = webrtc_streamer(
