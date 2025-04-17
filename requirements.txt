@@ -8,3 +8,4 @@ torchvision==0.17.0
 ultralytics==8.1.2
 streamlit-webrtc
 av
+aiortc
