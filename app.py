@@ -11,8 +11,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
-import av
+import uuid
 
 # Configuração inicial
 st.set_page_config(page_title="Sistema de Monitoramento de Veículos", layout="wide")
@@ -56,8 +55,10 @@ if 'update_counter' not in st.session_state:
     st.session_state.update_counter = 0
 if 'detection_counts' not in st.session_state:
     st.session_state.detection_counts = {}
-if 'webrtc_ctx' not in st.session_state:
-    st.session_state.webrtc_ctx = None
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+if 'camera_active' not in st.session_state:
+    st.session_state.camera_active = False
 
 # Variáveis globais para comunicação entre threads
 global_stats = {
@@ -114,7 +115,21 @@ def clean_plate_text(text):
     text = re.sub(r'[^A-Z0-9-]', '', text.upper())
     return text
 
+# Conversor de timestamp personalizado para SQLite
+def adapt_datetime(ts):
+    return ts.isoformat()
+
+def convert_datetime(ts):
+    try:
+        return datetime.fromisoformat(ts.decode())
+    except:
+        return datetime.now()
+
 def init_db():
+    # Registrar adaptadores para timestamp
+    sqlite3.register_adapter(datetime, adapt_datetime)
+    sqlite3.register_converter("timestamp", convert_datetime)
+    
     conn = sqlite3.connect('veiculos.db', detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
     c = conn.cursor()
     c.execute('''
@@ -188,7 +203,6 @@ def update_database_stats(conn):
                 total_placas_repetidas = cursor.fetchone()[0]
                 
                 # Atualizar dados mais recentes - sempre buscar os primeiros 5 registros
-                # Não depende mais de st.session_state.stats_page
                 cursor.execute("""
                     SELECT placa, tipo, cor, contagem, ultima_vista 
                     FROM veiculos 
@@ -337,55 +351,6 @@ def process_frame(frame, model, reader, conn):
         print(f"Erro ao processar frame: {str(e)}")
         return frame, [], []
 
-# Classe para processar frames da webcam com WebRTC
-class VideoProcessor(VideoProcessorBase):
-    def __init__(self, model, reader, conn):
-        self.model = model
-        self.reader = reader
-        self.conn = conn
-        
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        
-        # Salvar o frame original para possível captura de foto
-        st.session_state.last_frame = img.copy()
-        
-        # Processar o frame
-        processed_frame, detected_plates, current_detections = process_frame(img, self.model, self.reader, self.conn)
-        
-        # Salvar os resultados no session_state para uso posterior
-        st.session_state.last_processed_frame = processed_frame
-        st.session_state.last_detected_plates = detected_plates
-        st.session_state.last_current_detections = current_detections
-        
-        # Atualizar detecções atuais
-        st.session_state.current_detections = current_detections
-        
-        # Contar ocorrências de cada tipo para exibição em tempo real
-        detection_counts = {}
-        for det in current_detections:
-            if det in detection_counts:
-                detection_counts[det] += 1
-            else:
-                detection_counts[det] = 1
-        
-        # Atualizar o dicionário de contagens no session_state
-        st.session_state.detection_counts = detection_counts
-        
-        # Atualizar placas detectadas
-        for placa, tipo, cor in detected_plates:
-            if placa in st.session_state.current_session_plates:
-                st.session_state.current_session_plates[placa] = (
-                    st.session_state.current_session_plates[placa][0] + 1, tipo, cor
-                )
-            else:
-                st.session_state.current_session_plates[placa] = (1, tipo, cor)
-        
-        # Incrementar o contador de atualizações para trigger
-        st.session_state.update_counter += 1
-        
-        return av.VideoFrame.from_ndarray(processed_frame, format="bgr24")
-
 def main():
     global stop_thread, thread_running
     
@@ -415,12 +380,15 @@ def main():
                 st.session_state.detection_active = True
                 st.session_state.current_session_plates = {}
                 stop_thread = False
+                if fonte == "Câmera":
+                    st.session_state.camera_active = True
                 st.rerun()
         else:
             col_btns = st.columns(2)
             with col_btns[0]:
                 if st.button("Parar Detecção", use_container_width=True):
                     st.session_state.detection_active = False
+                    st.session_state.camera_active = False
                     stop_thread = True
                     st.rerun()
             with col_btns[1]:
@@ -462,65 +430,89 @@ def main():
             stats_thread.start()
         
         if fonte == "Câmera":
-            # Configuração para WebRTC
-            rtc_configuration = RTCConfiguration(
-                {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-            )
-
-            # Usar WebRTC para acessar a câmera do usuário
-            with video_placeholder.container():
-                webrtc_ctx = webrtc_streamer(
-                    key="vehicle-detection",
-                    video_processor_factory=lambda: VideoProcessor(model, reader, conn),
-                    rtc_configuration=rtc_configuration,
-                    media_stream_constraints={"video": True, "audio": False},
-                    async_processing=True,
-                )
+            # Usar OpenCV diretamente em vez de WebRTC
+            try:
+                cap = cv2.VideoCapture(0)
                 
-                # Armazenar o contexto WebRTC para uso posterior
-                st.session_state.webrtc_ctx = webrtc_ctx
-            
-            if st.session_state.take_photo and st.session_state.last_frame is not None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"captura_manual_{timestamp}.jpg"
-                filepath = SAVE_DIR / filename
-                cv2.imwrite(str(filepath), st.session_state.last_frame)
-                st.session_state.notification = f"Imagem salva em {filepath}"
-                st.session_state.notification_time = time.time()
-                st.session_state.take_photo = False
-            
-            # Contador para acompanhar atualizações
-            last_update_counter = 0
-            last_global_update = 0
-            
-            # Loop para atualizar a interface em tempo real
-            while st.session_state.detection_active and st.session_state.webrtc_ctx and st.session_state.webrtc_ctx.state.playing:
-                # Verificar se houve uma atualização nas detecções
-                if last_update_counter != st.session_state.update_counter:
-                    last_update_counter = st.session_state.update_counter
+                if not cap.isOpened():
+                    st.error("Não foi possível acessar a câmera. Verifique as permissões.")
+                    st.session_state.detection_active = False
+                    st.session_state.camera_active = False
+                    stop_thread = True
+                    st.rerun()
+                
+                stframe = video_placeholder.empty()
+                
+                # Adicionar mensagem de ajuda
+                st.caption("""
+                    Se a câmera não iniciar:
+                    1. Verifique as permissões da câmera
+                    2. Tente recarregar a página
+                    3. Use o modo de upload de vídeo como alternativa
+                """)
+                
+                # Loop para capturar e processar frames da câmera
+                while st.session_state.detection_active and st.session_state.camera_active:
+                    ret, frame = cap.read()
+                    if not ret:
+                        st.error("Erro ao capturar frame da câmera.")
+                        break
                     
-                    # 1. Detecções atuais - Atualizar em tempo real
+                    # Salvar o frame original para possível captura de foto
+                    st.session_state.last_frame = frame.copy()
+                    
+                    # Processar o frame
+                    processed_frame, detected_plates, current_detections = process_frame(frame, model, reader, conn)
+                    
+                    # Salvar os resultados no session_state para uso posterior
+                    st.session_state.last_processed_frame = processed_frame
+                    st.session_state.last_detected_plates = detected_plates
+                    st.session_state.last_current_detections = current_detections
+                    
+                    # Atualizar detecções atuais
+                    st.session_state.current_detections = current_detections
+                    
+                    # Contar ocorrências de cada tipo para exibição em tempo real
+                    detection_counts = {}
+                    for det in current_detections:
+                        if det in detection_counts:
+                            detection_counts[det] += 1
+                        else:
+                            detection_counts[det] = 1
+                    
+                    # Atualizar o dicionário de contagens no session_state
+                    st.session_state.detection_counts = detection_counts
+                    
+                    # Atualizar placas detectadas
+                    for placa, tipo, cor in detected_plates:
+                        if placa in st.session_state.current_session_plates:
+                            st.session_state.current_session_plates[placa] = (
+                                st.session_state.current_session_plates[placa][0] + 1, tipo, cor
+                            )
+                        else:
+                            st.session_state.current_session_plates[placa] = (1, tipo, cor)
+                    
+                    # Exibir o frame processado - corrigido para não usar use_container_width
+                    stframe.image(processed_frame, channels="BGR", caption="Detecção em tempo real")
+                    
+                    # Verificar se o usuário quer tirar uma foto
+                    if st.session_state.take_photo:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"captura_manual_{timestamp}.jpg"
+                        filepath = SAVE_DIR / filename
+                        cv2.imwrite(str(filepath), frame)
+                        st.session_state.notification = f"Imagem salva em {filepath}"
+                        st.session_state.notification_time = time.time()
+                        st.session_state.take_photo = False
+                    
+                    # Atualizar estatísticas em tempo real
+                    # 1. Detecções atuais
                     with detections_placeholder.container():
                         if st.session_state.detection_counts:
                             for tipo, count in st.session_state.detection_counts.items():
                                 st.write(f"**{tipo.capitalize()}**: {count}")
                         else:
                             st.write("Nenhuma detecção no momento")
-                    
-                    # 3. Placas detectadas
-                    with plates_placeholder.container():
-                        if st.session_state.current_session_plates:
-                            sorted_plates = sorted(st.session_state.current_session_plates.items(), 
-                                                key=lambda x: x[1][0], reverse=True)
-                            
-                            for placa, (count, tipo, cor) in sorted_plates:
-                                st.write(f"**{placa}** - {tipo} ({cor}) - {count}x")
-                        else:
-                            st.write("Nenhuma placa detectada na sessão atual.")
-                
-                # Verificar se houve uma atualização nas estatísticas do banco de dados
-                if last_global_update != global_stats['update_counter']:
-                    last_global_update = global_stats['update_counter']
                     
                     # 2. Contadores - usar os dados da variável global
                     with counters_placeholder.container():
@@ -534,39 +526,51 @@ def main():
                             st.metric("Placas na Sessão", len(st.session_state.current_session_plates))
                             st.metric("Repetidas na Sessão", sum(1 for _, (count, _, _) in st.session_state.current_session_plates.items() if count > 1))
                     
-                    # 5. Dados de estatísticas
-                    with stats_data_placeholder.container():
-                        # Usar os dados da variável global
-                        dados = global_stats['latest_data']
-                        
-                        if dados:
-                            for d in dados:
-                                st.write(f"**{d[0]}** - {d[1]} ({d[2]}) - Visto {d[3]}x - Última vez: {d[4]}")
-                            st.caption(f"Página {st.session_state.stats_page + 1}")
+                    # 3. Placas detectadas
+                    with plates_placeholder.container():
+                        if st.session_state.current_session_plates:
+                            sorted_plates = sorted(st.session_state.current_session_plates.items(), 
+                                                key=lambda x: x[1][0], reverse=True)
+                            
+                            for placa, (count, tipo, cor) in sorted_plates:
+                                st.write(f"**{placa}** - {tipo} ({cor}) - {count}x")
                         else:
-                            st.write("Nenhum veículo registrado ou fim dos registros.")
-                
-                # 4. Navegação de estatísticas - Usando chaves únicas
-                with stats_nav_placeholder.container():
-                    stats_cols = st.columns(3)
+                            st.write("Nenhuma placa detectada na sessão atual.")
                     
-                    with stats_cols[0]:
-                        if st.button("⬆️ Topo", key=get_unique_key("btn_top_cam")):
-                            st.session_state.stats_page = 0
-                            # Buscar dados específicos para esta página
-                            cursor = conn.cursor()
-                            cursor.execute("""
-                                SELECT placa, tipo, cor, contagem, ultima_vista 
-                                FROM veiculos 
-                                ORDER BY ultima_vista DESC
-                                LIMIT 5 OFFSET ?
-                            """, (st.session_state.stats_page * 5,))
-                            st.session_state.latest_data = cursor.fetchall()
-                    
-                    with stats_cols[1]:
-                        if st.session_state.stats_page > 0:
-                            if st.button("⬅️ Anterior", key=get_unique_key("btn_prev_cam")):
-                                st.session_state.stats_page -= 1
+                    # 4. Navegação de estatísticas
+                    with stats_nav_placeholder.container():
+                        stats_cols = st.columns(3)
+                        
+                        with stats_cols[0]:
+                            if st.button("⬆️ Topo", key=get_unique_key("btn_top_cam")):
+                                st.session_state.stats_page = 0
+                                # Buscar dados específicos para esta página
+                                cursor = conn.cursor()
+                                cursor.execute("""
+                                    SELECT placa, tipo, cor, contagem, ultima_vista 
+                                    FROM veiculos 
+                                    ORDER BY ultima_vista DESC
+                                    LIMIT 5 OFFSET ?
+                                """, (st.session_state.stats_page * 5,))
+                                st.session_state.latest_data = cursor.fetchall()
+                        
+                        with stats_cols[1]:
+                            if st.session_state.stats_page > 0:
+                                if st.button("⬅️ Anterior", key=get_unique_key("btn_prev_cam")):
+                                    st.session_state.stats_page -= 1
+                                    # Buscar dados específicos para esta página
+                                    cursor = conn.cursor()
+                                    cursor.execute("""
+                                        SELECT placa, tipo, cor, contagem, ultima_vista 
+                                        FROM veiculos 
+                                        ORDER BY ultima_vista DESC
+                                        LIMIT 5 OFFSET ?
+                                    """, (st.session_state.stats_page * 5,))
+                                    st.session_state.latest_data = cursor.fetchall()
+                        
+                        with stats_cols[2]:
+                            if st.button("➡️ Próxima", key=get_unique_key("btn_next_cam")):
+                                st.session_state.stats_page += 1
                                 # Buscar dados específicos para esta página
                                 cursor = conn.cursor()
                                 cursor.execute("""
@@ -577,21 +581,31 @@ def main():
                                 """, (st.session_state.stats_page * 5,))
                                 st.session_state.latest_data = cursor.fetchall()
                     
-                    with stats_cols[2]:
-                        if st.button("➡️ Próxima", key=get_unique_key("btn_next_cam")):
-                            st.session_state.stats_page += 1
-                            # Buscar dados específicos para esta página
-                            cursor = conn.cursor()
-                            cursor.execute("""
-                                SELECT placa, tipo, cor, contagem, ultima_vista 
-                                FROM veiculos 
-                                ORDER BY ultima_vista DESC
-                                LIMIT 5 OFFSET ?
-                            """, (st.session_state.stats_page * 5,))
-                            st.session_state.latest_data = cursor.fetchall()
+                    # 5. Dados de estatísticas
+                    with stats_data_placeholder.container():
+                        # Usar os dados da variável global ou da sessão
+                        dados = st.session_state.latest_data if hasattr(st.session_state, 'latest_data') and st.session_state.latest_data else global_stats['latest_data']
+                        
+                        if dados:
+                            for d in dados:
+                                st.write(f"**{d[0]}** - {d[1]} ({d[2]}) - Visto {d[3]}x - Última vez: {d[4]}")
+                            st.caption(f"Página {st.session_state.stats_page + 1}")
+                        else:
+                            st.write("Nenhum veículo registrado ou fim dos registros.")
+                    
+                    # Incrementar o contador de atualizações para trigger
+                    st.session_state.update_counter += 1
+                    
+                    # Pequena pausa para não sobrecarregar a CPU
+                    time.sleep(0.1)
                 
-                # Pequena pausa para não sobrecarregar a CPU
-                time.sleep(0.1)
+                # Liberar a câmera quando terminar
+                cap.release()
+            except Exception as e:
+                st.error(f"Erro ao acessar a câmera: {str(e)}")
+                st.info("Tente usar o modo de upload de vídeo como alternativa.")
+                st.session_state.detection_active = False
+                st.session_state.camera_active = False
         
         else:
             video_file = st.file_uploader("Faça upload do vídeo", type=['mp4', 'avi'], key="video_upload")
@@ -641,7 +655,8 @@ def main():
                         else:
                             st.session_state.current_session_plates[placa] = (1, tipo, cor)
                     
-                    stframe.image(frame_processed, channels="BGR", caption="Detecção em tempo real", use_container_width=True)
+                    # Exibir o frame processado - corrigido para não usar use_container_width
+                    stframe.image(frame_processed, channels="BGR", caption="Detecção em tempo real")
                     
                     # Atualizar estatísticas em tempo real
                     # 1. Detecções atuais
@@ -651,7 +666,7 @@ def main():
                                 st.write(f"**{tipo.capitalize()}**: {count}")
                         else:
                             st.write("Nenhuma detecção no momento")
-
+                    
                     # 2. Contadores - usar os dados da variável global
                     with counters_placeholder.container():
                         col_counters = st.columns(2)
