@@ -13,6 +13,8 @@ import re
 import threading
 import uuid
 import tempfile
+import av
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
 
 # Configuração inicial
 st.set_page_config(page_title="Sistema de Monitoramento de Veículos", layout="wide")
@@ -64,16 +66,32 @@ if 'db_initialized' not in st.session_state:
     st.session_state.db_initialized = False
 if 'thread_error' not in st.session_state:
     st.session_state.thread_error = None
+if 'webrtc_ctx' not in st.session_state:
+    st.session_state.webrtc_ctx = None
+if 'webrtc_state' not in st.session_state:
+    st.session_state.webrtc_state = False
 
 # Variáveis globais para comunicação entre threads
 global_stats = {
     'total_placas': 0,
     'total_placas_repetidas': 0,
     'latest_data': [],
-    'update_counter': 0
+    'update_counter': 0,
+    'current_detections': [],
+    'detection_counts': {},
+    'detected_plates': []
 }
 thread_running = False
 stop_thread = False
+
+# Variáveis globais para compartilhar dados entre o VideoProcessor e o aplicativo principal
+# Isso evita o uso de st.session_state dentro do VideoProcessor
+global_frame = None
+global_detected_plates = []
+global_current_detections = []
+global_take_photo = False
+global_photo_taken = False
+global_photo_path = None
 
 # Função para gerar chaves únicas para botões
 def get_unique_key(prefix):
@@ -172,32 +190,36 @@ def load_models():
         return None, None
 
 def detect_color(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    
-    color_ranges = {
-        'vermelho': ([0, 100, 100], [10, 255, 255]),
-        'amarelo': ([20, 100, 100], [30, 255, 255]),
-        'verde': ([40, 40, 40], [80, 255, 255]),
-        'azul': ([90, 50, 50], [130, 255, 255]),
-        'branco': ([0, 0, 200], [180, 30, 255]),
-        'preto': ([0, 0, 0], [180, 255, 30]),
-        'cinza': ([0, 0, 40], [180, 30, 200])
-    }
-    
-    max_count = 0
-    detected_color = "desconhecida"
-    
-    for color, (lower, upper) in color_ranges.items():
-        lower = np.array(lower, dtype=np.uint8)
-        upper = np.array(upper, dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        count = cv2.countNonZero(mask)
+    try:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
-        if count > max_count:
-            max_count = count
-            detected_color = color
-    
-    return detected_color
+        color_ranges = {
+            'vermelho': ([0, 100, 100], [10, 255, 255]),
+            'amarelo': ([20, 100, 100], [30, 255, 255]),
+            'verde': ([40, 40, 40], [80, 255, 255]),
+            'azul': ([90, 50, 50], [130, 255, 255]),
+            'branco': ([0, 0, 200], [180, 30, 255]),
+            'preto': ([0, 0, 0], [180, 255, 30]),
+            'cinza': ([0, 0, 40], [180, 30, 200])
+        }
+        
+        max_count = 0
+        detected_color = "desconhecida"
+        
+        for color, (lower, upper) in color_ranges.items():
+            lower = np.array(lower, dtype=np.uint8)
+            upper = np.array(upper, dtype=np.uint8)
+            mask = cv2.inRange(hsv, lower, upper)
+            count = cv2.countNonZero(mask)
+            
+            if count > max_count:
+                max_count = count
+                detected_color = color
+        
+        return detected_color
+    except Exception as e:
+        print(f"Erro ao detectar cor: {str(e)}")
+        return "desconhecida"
 
 def update_database_stats(conn):
     """
@@ -235,10 +257,10 @@ def update_database_stats(conn):
                 global_stats['update_counter'] += 1
                 
                 # Pequena pausa para não sobrecarregar o banco de dados
-                time.sleep(0.5)
+                time.sleep(1.0)
             except Exception as e:
                 st.session_state.thread_error = f"Erro na consulta ao banco de dados: {str(e)}"
-                time.sleep(1)
+                time.sleep(2.0)
     except Exception as e:
         st.session_state.thread_error = f"Erro na thread de atualização: {str(e)}"
     finally:
@@ -249,7 +271,10 @@ def process_frame(frame, model, reader, conn):
         return None, [], []
     
     try:
-        results = model(frame, conf=0.5)  # Aumentar confiança mínima
+        # Processar com o modelo YOLO
+        results = model(frame, conf=0.5)
+        
+        # Criar uma cópia para desenhar
         frame_draw = frame.copy()
         detected_plates = []
         current_detections = []
@@ -264,6 +289,7 @@ def process_frame(frame, model, reader, conn):
                     cor, tipo = CLASSES[cls]
                     current_detections.append(tipo)
                     
+                    # Verificar se as coordenadas são válidas
                     if y2 > y1 and x2 > x1 and y1 >= 0 and x1 >= 0:
                         roi = frame[y1:y2, x1:x2]
                         
@@ -280,85 +306,87 @@ def process_frame(frame, model, reader, conn):
                             cv2.polylines(frame_draw, [contours], True, cor, 2)
                             
                             # Adicionar texto do tipo de objeto
-                            cv2.putText(frame_draw, tipo, (x1, y1 - 30), 
+                            cv2.putText(frame_draw, tipo, (x1, y1 - 10), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, cor, 2)
                             
-                            veiculo_cor = "N/A"
+                            # Processar apenas veículos para detecção de placa
                             if tipo != 'pessoa':
-                                veiculo_cor = detect_color(roi)
-                                
                                 try:
-                                    # Melhorar detecção de placa
-                                    placa_results = reader.readtext(roi, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
-                                    placa_results = [r for r in placa_results if r[2] > 0.6]  # Aumentar confiança
+                                    veiculo_cor = detect_color(roi)
                                     
-                                    if placa_results:
-                                        potential_plate = clean_plate_text(placa_results[0][1])
+                                    # Melhorar detecção de placa - apenas para veículos maiores
+                                    if roi.shape[0] > 50 and roi.shape[1] > 50:
+                                        placa_results = reader.readtext(roi, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
+                                        placa_results = [r for r in placa_results if r[2] > 0.6]  # Aumentar confiança
                                         
-                                        if is_valid_brazilian_plate(potential_plate):
-                                            placa = format_plate(potential_plate)
+                                        if placa_results:
+                                            potential_plate = clean_plate_text(placa_results[0][1])
                                             
-                                            cursor = conn.cursor()
-                                            cursor.execute("SELECT contagem FROM veiculos WHERE placa = ?", (placa,))
-                                            result = cursor.fetchone()
-                                            
-                                            # Definir cor da placa baseado no histórico
-                                            if placa in st.session_state.current_session_plates:
-                                                cor_placa = (255, 0, 0)  # Vermelho para placas já vistas na sessão
-                                            elif result:
-                                                cor_placa = (255, 0, 255)  # Roxo para placas já vistas antes
-                                            else:
-                                                cor_placa = (0, 255, 0)  # Verde para novas placas
-                                            
-                                            if result:
-                                                nova_contagem = result[0] + 1
-                                                cursor.execute("""
-                                                    UPDATE veiculos 
-                                                    SET contagem = ?, ultima_vista = ?, tipo = ?, cor = ?
-                                                    WHERE placa = ?
-                                                """, (nova_contagem, datetime.now(), tipo, veiculo_cor, placa))
-                                            else:
-                                                cursor.execute("""
-                                                    INSERT INTO veiculos (placa, tipo, cor, contagem, ultima_vista)
-                                                    VALUES (?, ?, ?, 1, ?)
-                                                """, (placa, tipo, veiculo_cor, datetime.now()))
-                                            
-                                            conn.commit()
-                                            detected_plates.append((placa, tipo, veiculo_cor))
-                                            
-                                            # Desenhar placa com fundo
-                                            texto = f"{placa}"
-                                            font = cv2.FONT_HERSHEY_SIMPLEX
-                                            font_scale = 0.7
-                                            thickness = 2
-                                            
-                                            # Obter tamanho do texto
-                                            (text_width, text_height), _ = cv2.getTextSize(texto, font, font_scale, thickness)
-                                            
-                                            # Coordenadas para o fundo
-                                            text_x = x1
-                                            text_y = y1 - 10
-                                            padding = 5
-                                            
-                                            # Desenhar fundo branco
-                                            cv2.rectangle(frame_draw,
-                                                        (text_x - padding, text_y - text_height - padding),
-                                                        (text_x + text_width + padding, text_y + padding),
-                                                        (255, 255, 255),
-                                                        -1)
-                                            
-                                            # Desenhar borda colorida
-                                            cv2.rectangle(frame_draw,
-                                                        (text_x - padding, text_y - text_height - padding),
-                                                        (text_x + text_width + padding, text_y + padding),
-                                                        cor_placa,
-                                                        2)
-                                            
-                                            # Desenhar texto
-                                            cv2.putText(frame_draw, texto,
-                                                      (text_x, text_y),
-                                                      font, font_scale, (0, 0, 0), thickness)
+                                            if is_valid_brazilian_plate(potential_plate):
+                                                placa = format_plate(potential_plate)
+                                                
+                                                cursor = conn.cursor()
+                                                cursor.execute("SELECT contagem FROM veiculos WHERE placa = ?", (placa,))
+                                                result = cursor.fetchone()
+                                                
+                                                # Definir cor da placa baseado no histórico
+                                                if placa in st.session_state.current_session_plates:
+                                                    cor_placa = (255, 0, 0)  # Vermelho para placas já vistas na sessão
+                                                elif result:
+                                                    cor_placa = (255, 0, 255)  # Roxo para placas já vistas antes
+                                                else:
+                                                    cor_placa = (0, 255, 0)  # Verde para novas placas
+                                                
+                                                if result:
+                                                    nova_contagem = result[0] + 1
+                                                    cursor.execute("""
+                                                        UPDATE veiculos 
+                                                        SET contagem = ?, ultima_vista = ?, tipo = ?, cor = ?
+                                                        WHERE placa = ?
+                                                    """, (nova_contagem, datetime.now(), tipo, veiculo_cor, placa))
+                                                else:
+                                                    cursor.execute("""
+                                                        INSERT INTO veiculos (placa, tipo, cor, contagem, ultima_vista)
+                                                        VALUES (?, ?, ?, 1, ?)
+                                                    """, (placa, tipo, veiculo_cor, datetime.now()))
+                                                
+                                                conn.commit()
+                                                detected_plates.append((placa, tipo, veiculo_cor))
+                                                
+                                                # Desenhar placa com fundo
+                                                texto = f"{placa}"
+                                                font = cv2.FONT_HERSHEY_SIMPLEX
+                                                font_scale = 0.7
+                                                thickness = 2
+                                                
+                                                # Obter tamanho do texto
+                                                (text_width, text_height), _ = cv2.getTextSize(texto, font, font_scale, thickness)
+                                                
+                                                # Coordenadas para o fundo
+                                                text_x = x1
+                                                text_y = y1 - 10
+                                                padding = 5
+                                                
+                                                # Desenhar fundo branco
+                                                cv2.rectangle(frame_draw,
+                                                            (text_x - padding, text_y - text_height - padding),
+                                                            (text_x + text_width + padding, text_y + padding),
+                                                            (255, 255, 255),
+                                                            -1)
+                                                
+                                                # Desenhar borda colorida
+                                                cv2.rectangle(frame_draw,
+                                                            (text_x - padding, text_y - text_height - padding),
+                                                            (text_x + text_width + padding, text_y + padding),
+                                                            cor_placa,
+                                                            2)
+                                                
+                                                # Desenhar texto
+                                                cv2.putText(frame_draw, texto,
+                                                          (text_x, text_y),
+                                                          font, font_scale, (0, 0, 0), thickness)
                                 except Exception as e:
+                                    # Ignorar erros de processamento de placa
                                     pass
         
         return frame_draw, detected_plates, current_detections
@@ -367,8 +395,78 @@ def process_frame(frame, model, reader, conn):
         print(f"Erro ao processar frame: {str(e)}")
         return frame, [], []
 
+# Classe para processamento de vídeo com WebRTC - versão simplificada
+class VideoProcessor(VideoProcessorBase):
+    def __init__(self, model, reader, conn):
+        self.model = model
+        self.reader = reader
+        self.conn = conn
+        self.frame_count = 0
+        self.last_process_time = time.time()
+        self.skip_frames = 5  # Processar apenas 1 a cada 5 frames
+    
+    def recv(self, frame):
+        global global_frame, global_detected_plates, global_current_detections
+        global global_take_photo, global_photo_taken, global_photo_path
+        
+        img = frame.to_ndarray(format="bgr24")
+        
+        # Salvar o frame original para possível captura de foto
+        global_frame = img.copy()
+        
+        # Processar apenas alguns frames para melhorar o desempenho
+        self.frame_count += 1
+        current_time = time.time()
+        
+        # Limitar o processamento para reduzir a carga
+        if self.frame_count % self.skip_frames != 0 or (current_time - self.last_process_time) < 0.2:
+            # Apenas adicionar texto informativo sem processamento
+            cv2.putText(img, "Monitoramento ativo", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+        
+        self.last_process_time = current_time
+        
+        try:
+            # Processar o frame
+            processed_frame, detected_plates, current_detections = process_frame(img, self.model, self.reader, self.conn)
+            
+            # Atualizar variáveis globais para comunicação com o aplicativo principal
+            global_detected_plates = detected_plates
+            global_current_detections = current_detections
+            
+            # Verificar se o usuário quer tirar uma foto
+            if global_take_photo:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"captura_manual_{timestamp}.jpg"
+                filepath = SAVE_DIR / filename
+                cv2.imwrite(str(filepath), img)
+                global_photo_path = str(filepath)
+                global_photo_taken = True
+                global_take_photo = False
+            
+            if processed_frame is not None:
+                # Adicionar informações sobre detecções na imagem
+                if current_detections:
+                    detection_text = ", ".join(set(current_detections))
+                    cv2.putText(processed_frame, f"Detectado: {detection_text}", (10, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                return av.VideoFrame.from_ndarray(processed_frame, format="bgr24")
+            else:
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
+        
+        except Exception as e:
+            print(f"Erro no processamento WebRTC: {str(e)}")
+            # Em caso de erro, retornar o frame original com mensagem de erro
+            cv2.putText(img, f"Erro: {str(e)[:30]}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
 def main():
     global stop_thread, thread_running
+    global global_take_photo, global_photo_taken, global_photo_path
+    global global_detected_plates, global_current_detections
     
     st.title("Sistema de Monitoramento de Veículos")
     
@@ -418,10 +516,12 @@ def main():
                 if st.button("Parar Detecção", use_container_width=True):
                     st.session_state.detection_active = False
                     st.session_state.camera_active = False
+                    st.session_state.webrtc_state = False
                     stop_thread = True
                     st.rerun()
             with col_btns[1]:
                 if st.button("Tirar Foto", use_container_width=True):
+                    global_take_photo = True
                     st.session_state.take_photo = True
         
         # Notificações
@@ -431,6 +531,13 @@ def main():
                 st.info(st.session_state.notification)
             else:
                 st.session_state.notification = None
+        
+        # Verificar se uma foto foi tirada
+        if global_photo_taken:
+            st.success(f"Imagem salva em {global_photo_path}")
+            global_photo_taken = False
+            st.session_state.notification = f"Imagem salva em {global_photo_path}"
+            st.session_state.notification_time = time.time()
         
         # Exibir erros de thread se houver
         if st.session_state.thread_error:
@@ -467,106 +574,53 @@ def main():
                 st.error(f"Erro ao iniciar thread de estatísticas: {str(e)}")
         
         if fonte == "Câmera":
-            # No Streamlit Cloud, a câmera pode não funcionar corretamente
-            # Exibir uma mensagem informativa
-            if os.environ.get('STREAMLIT_SHARING') or os.environ.get('STREAMLIT_CLOUD'):
-                st.warning("""
-                    ⚠️ Atenção: O acesso à câmera pode não funcionar no Streamlit Cloud.
-                    Recomendamos usar o modo de upload de vídeo ou executar o aplicativo localmente.
-                """)
+            # Configuração para WebRTC
+            rtc_configuration = RTCConfiguration(
+                {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+            )
             
-            # Tentar acessar a câmera com tratamento de erro aprimorado
-            try:
-                cap = cv2.VideoCapture(0)
+            # Informar ao usuário sobre o uso da câmera
+            st.info("Usando WebRTC para acessar a câmera. Por favor, conceda permissão quando solicitado.")
+            
+            # Iniciar WebRTC streamer com configurações simplificadas
+            webrtc_ctx = webrtc_streamer(
+                key="vehicle-detection",
+                mode=WebRtcMode.SENDRECV,
+                rtc_configuration=rtc_configuration,
+                video_processor_factory=lambda: VideoProcessor(model, reader, conn),
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=True,
+            )
+            
+            # Armazenar o contexto WebRTC no session_state
+            st.session_state.webrtc_ctx = webrtc_ctx
+            st.session_state.webrtc_state = webrtc_ctx.state.playing
+            
+            # Verificar se o WebRTC está ativo
+            if webrtc_ctx.state.playing:
+                st.write("Câmera ativa. Processando frames...")
                 
-                if not cap.isOpened():
-                    st.error("Não foi possível acessar a câmera. Verifique as permissões.")
-                    st.info("Tente usar o modo de upload de vídeo como alternativa.")
-                    st.session_state.detection_active = False
-                    st.session_state.camera_active = False
-                    stop_thread = True
-                    st.rerun()
+                # Criar um container para atualização das estatísticas
+                stats_container = st.empty()
                 
-                stframe = video_placeholder.empty()
-                
-                # Adicionar mensagem de ajuda
-                st.caption("""
-                    Se a câmera não iniciar:
-                    1. Verifique as permissões da câmera
-                    2. Tente recarregar a página
-                    3. Use o modo de upload de vídeo como alternativa
-                """)
-                
-                # Loop para capturar e processar frames da câmera
-                frame_count = 0
-                while st.session_state.detection_active and st.session_state.camera_active:
-                    ret, frame = cap.read()
-                    if not ret:
-                        st.error("Erro ao capturar frame da câmera.")
-                        break
-                    
-                    # Processar apenas alguns frames para melhorar o desempenho
-                    frame_count += 1
-                    if frame_count % 3 != 0:  # Processar a cada 3 frames
-                        continue
-                    
-                    # Salvar o frame original para possível captura de foto
-                    st.session_state.last_frame = frame.copy()
-                    
-                    # Processar o frame
-                    processed_frame, detected_plates, current_detections = process_frame(frame, model, reader, conn)
-                    
-                    # Salvar os resultados no session_state para uso posterior
-                    st.session_state.last_processed_frame = processed_frame
-                    st.session_state.last_detected_plates = detected_plates
-                    st.session_state.last_current_detections = current_detections
-                    
-                    # Atualizar detecções atuais
-                    st.session_state.current_detections = current_detections
-                    
-                    # Contar ocorrências de cada tipo para exibição em tempo real
-                    detection_counts = {}
-                    for det in current_detections:
-                        if det in detection_counts:
-                            detection_counts[det] += 1
-                        else:
-                            detection_counts[det] = 1
-                    
-                    # Atualizar o dicionário de contagens no session_state
-                    st.session_state.detection_counts = detection_counts
-                    
-                    # Atualizar placas detectadas
-                    for placa, tipo, cor in detected_plates:
-                        if placa in st.session_state.current_session_plates:
-                            st.session_state.current_session_plates[placa] = (
-                                st.session_state.current_session_plates[placa][0] + 1, tipo, cor
-                            )
-                        else:
-                            st.session_state.current_session_plates[placa] = (1, tipo, cor)
-                    
-                    # Exibir o frame processado
-                    stframe.image(processed_frame, channels="BGR", caption="Detecção em tempo real")
-                    
-                    # Verificar se o usuário quer tirar uma foto
-                    if st.session_state.take_photo:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        filename = f"captura_manual_{timestamp}.jpg"
-                        filepath = SAVE_DIR / filename
-                        cv2.imwrite(str(filepath), frame)
-                        st.session_state.notification = f"Imagem salva em {filepath}"
-                        st.session_state.notification_time = time.time()
-                        st.session_state.take_photo = False
-                    
-                    # Atualizar estatísticas em tempo real
+                # Atualizar estatísticas iniciais
+                with stats_container.container():
                     # 1. Detecções atuais
                     with detections_placeholder.container():
-                        if st.session_state.detection_counts:
-                            for tipo, count in st.session_state.detection_counts.items():
+                        if global_current_detections:
+                            detection_counts = {}
+                            for det in global_current_detections:
+                                if det in detection_counts:
+                                    detection_counts[det] += 1
+                                else:
+                                    detection_counts[det] = 1
+                            
+                            for tipo, count in detection_counts.items():
                                 st.write(f"**{tipo.capitalize()}**: {count}")
                         else:
                             st.write("Nenhuma detecção no momento")
                     
-                    # 2. Contadores - usar os dados da variável global
+                    # 2. Contadores
                     with counters_placeholder.container():
                         col_counters = st.columns(2)
                         
@@ -580,6 +634,15 @@ def main():
                     
                     # 3. Placas detectadas
                     with plates_placeholder.container():
+                        # Atualizar placas detectadas com base nas detecções globais
+                        for placa, tipo, cor in global_detected_plates:
+                            if placa in st.session_state.current_session_plates:
+                                st.session_state.current_session_plates[placa] = (
+                                    st.session_state.current_session_plates[placa][0] + 1, tipo, cor
+                                )
+                            else:
+                                st.session_state.current_session_plates[placa] = (1, tipo, cor)
+                        
                         if st.session_state.current_session_plates:
                             sorted_plates = sorted(st.session_state.current_session_plates.items(), 
                                                 key=lambda x: x[1][0], reverse=True)
@@ -644,20 +707,12 @@ def main():
                             st.caption(f"Página {st.session_state.stats_page + 1}")
                         else:
                             st.write("Nenhum veículo registrado ou fim dos registros.")
-                    
-                    # Incrementar o contador de atualizações para trigger
-                    st.session_state.update_counter += 1
-                    
-                    # Pequena pausa para não sobrecarregar a CPU
-                    time.sleep(0.1)
                 
-                # Liberar a câmera quando terminar
-                cap.release()
-            except Exception as e:
-                st.error(f"Erro ao acessar a câmera: {str(e)}")
-                st.info("Tente usar o modo de upload de vídeo como alternativa.")
-                st.session_state.detection_active = False
-                st.session_state.camera_active = False
+                # Usar st.rerun() para atualizar a interface periodicamente
+                time.sleep(2.0)  # Atualizar a cada 2 segundos
+                st.rerun()
+            else:
+                st.warning("Câmera não iniciada. Por favor, conceda permissão de acesso à câmera.")
         
         else:
             video_file = st.file_uploader("Faça upload do vídeo", type=['mp4', 'avi'], key="video_upload")
@@ -676,12 +731,20 @@ def main():
                 
                 stframe = video_placeholder.empty()
                 
+                # Processar o vídeo frame a frame
+                frame_skip = 2  # Processar 1 a cada 2 frames para melhorar desempenho
+                frame_count = 0
+                
                 while st.session_state.detection_active:
                     ret, frame = cap.read()
                     if not ret:
                         st.info("Fim do vídeo.")
                         st.session_state.detection_active = False
                         break
+                    
+                    frame_count += 1
+                    if frame_count % frame_skip != 0:
+                        continue
                     
                     frame_processed, detected_plates, current_detections = process_frame(frame, model, reader, conn)
                     
@@ -800,10 +863,8 @@ def main():
                             if st.session_state.stats_page > 0:
                                 st.session_state.stats_page -= 1
                     
-                    # Incrementar o contador de atualizações para trigger
-                    st.session_state.update_counter += 1
-                    
-                    time.sleep(0.03)
+                    # Pequena pausa para não sobrecarregar a CPU
+                    time.sleep(0.05)
                 
                 cap.release()
                 if os.path.exists(temp_file):
