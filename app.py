@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import threading
 import uuid
+import tempfile
 
 # Configuração inicial
 st.set_page_config(page_title="Sistema de Monitoramento de Veículos", layout="wide")
@@ -59,6 +60,10 @@ if 'session_id' not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if 'camera_active' not in st.session_state:
     st.session_state.camera_active = False
+if 'db_initialized' not in st.session_state:
+    st.session_state.db_initialized = False
+if 'thread_error' not in st.session_state:
+    st.session_state.thread_error = None
 
 # Variáveis globais para comunicação entre threads
 global_stats = {
@@ -130,7 +135,17 @@ def init_db():
     sqlite3.register_adapter(datetime, adapt_datetime)
     sqlite3.register_converter("timestamp", convert_datetime)
     
-    conn = sqlite3.connect('veiculos.db', detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+    # Usar um arquivo temporário para o banco de dados no Streamlit Cloud
+    # ou um arquivo local em desenvolvimento
+    if os.environ.get('STREAMLIT_SHARING') or os.environ.get('STREAMLIT_CLOUD'):
+        # No Streamlit Cloud, usar um arquivo temporário
+        temp_dir = tempfile.gettempdir()
+        db_path = os.path.join(temp_dir, 'veiculos.db')
+    else:
+        # Em desenvolvimento local, usar o arquivo no diretório atual
+        db_path = 'veiculos.db'
+    
+    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS veiculos (
@@ -148,9 +163,10 @@ def init_db():
 @st.cache_resource
 def load_models():
     try:
-        model = YOLO('yolov8n.pt')
-        reader = easyocr.Reader(['pt'])
-        return model, reader
+        with st.spinner("Carregando modelos de detecção..."):
+            model = YOLO('yolov8n.pt')
+            reader = easyocr.Reader(['pt'])
+            return model, reader
     except Exception as e:
         st.error(f"Erro ao carregar modelos: {str(e)}")
         return None, None
@@ -221,10 +237,10 @@ def update_database_stats(conn):
                 # Pequena pausa para não sobrecarregar o banco de dados
                 time.sleep(0.5)
             except Exception as e:
-                print(f"Erro na consulta ao banco de dados: {str(e)}")
+                st.session_state.thread_error = f"Erro na consulta ao banco de dados: {str(e)}"
                 time.sleep(1)
     except Exception as e:
-        print(f"Erro na thread de atualização: {str(e)}")
+        st.session_state.thread_error = f"Erro na thread de atualização: {str(e)}"
     finally:
         thread_running = False
 
@@ -356,7 +372,20 @@ def main():
     
     st.title("Sistema de Monitoramento de Veículos")
     
-    conn = init_db()
+    # Inicializar o banco de dados apenas uma vez
+    if not st.session_state.db_initialized:
+        conn = init_db()
+        st.session_state.db_initialized = True
+    else:
+        # Reutilizar a conexão existente
+        if os.environ.get('STREAMLIT_SHARING') or os.environ.get('STREAMLIT_CLOUD'):
+            temp_dir = tempfile.gettempdir()
+            db_path = os.path.join(temp_dir, 'veiculos.db')
+        else:
+            db_path = 'veiculos.db'
+        conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES, check_same_thread=False)
+    
+    # Carregar modelos
     model, reader = load_models()
     
     if model is None or reader is None:
@@ -403,6 +432,11 @@ def main():
             else:
                 st.session_state.notification = None
         
+        # Exibir erros de thread se houver
+        if st.session_state.thread_error:
+            st.error(st.session_state.thread_error)
+            st.session_state.thread_error = None
+        
         # Placeholder para o vídeo
         video_placeholder = st.empty()
     
@@ -426,16 +460,28 @@ def main():
     if st.session_state.detection_active:
         # Iniciar thread para atualizar estatísticas se ainda não estiver rodando
         if not thread_running:
-            stats_thread = threading.Thread(target=update_database_stats, args=(conn,), daemon=True)
-            stats_thread.start()
+            try:
+                stats_thread = threading.Thread(target=update_database_stats, args=(conn,), daemon=True)
+                stats_thread.start()
+            except Exception as e:
+                st.error(f"Erro ao iniciar thread de estatísticas: {str(e)}")
         
         if fonte == "Câmera":
-            # Usar OpenCV diretamente em vez de WebRTC
+            # No Streamlit Cloud, a câmera pode não funcionar corretamente
+            # Exibir uma mensagem informativa
+            if os.environ.get('STREAMLIT_SHARING') or os.environ.get('STREAMLIT_CLOUD'):
+                st.warning("""
+                    ⚠️ Atenção: O acesso à câmera pode não funcionar no Streamlit Cloud.
+                    Recomendamos usar o modo de upload de vídeo ou executar o aplicativo localmente.
+                """)
+            
+            # Tentar acessar a câmera com tratamento de erro aprimorado
             try:
                 cap = cv2.VideoCapture(0)
                 
                 if not cap.isOpened():
                     st.error("Não foi possível acessar a câmera. Verifique as permissões.")
+                    st.info("Tente usar o modo de upload de vídeo como alternativa.")
                     st.session_state.detection_active = False
                     st.session_state.camera_active = False
                     stop_thread = True
@@ -452,11 +498,17 @@ def main():
                 """)
                 
                 # Loop para capturar e processar frames da câmera
+                frame_count = 0
                 while st.session_state.detection_active and st.session_state.camera_active:
                     ret, frame = cap.read()
                     if not ret:
                         st.error("Erro ao capturar frame da câmera.")
                         break
+                    
+                    # Processar apenas alguns frames para melhorar o desempenho
+                    frame_count += 1
+                    if frame_count % 3 != 0:  # Processar a cada 3 frames
+                        continue
                     
                     # Salvar o frame original para possível captura de foto
                     st.session_state.last_frame = frame.copy()
@@ -492,7 +544,7 @@ def main():
                         else:
                             st.session_state.current_session_plates[placa] = (1, tipo, cor)
                     
-                    # Exibir o frame processado - corrigido para não usar use_container_width
+                    # Exibir o frame processado
                     stframe.image(processed_frame, channels="BGR", caption="Detecção em tempo real")
                     
                     # Verificar se o usuário quer tirar uma foto
@@ -655,7 +707,7 @@ def main():
                         else:
                             st.session_state.current_session_plates[placa] = (1, tipo, cor)
                     
-                    # Exibir o frame processado - corrigido para não usar use_container_width
+                    # Exibir o frame processado
                     stframe.image(frame_processed, channels="BGR", caption="Detecção em tempo real")
                     
                     # Atualizar estatísticas em tempo real
